@@ -713,7 +713,7 @@ def start_visualization(output, min_conf_thr_percentile=10, global_conf_thr_valu
         except Exception as e:
             print(f"Failed to generate PLY: {e}")
 
-    public_url = None
+    public_url = server.request_share_url()
     return server
 
 # Example usage:

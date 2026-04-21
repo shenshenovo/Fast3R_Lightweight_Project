@@ -7,7 +7,7 @@
 import os
 from copy import deepcopy
 import time
-from typing import Optional, Sequence, Tuple, Union
+from typing import Optional
 from einops import rearrange
 import huggingface_hub
 from omegaconf import DictConfig, OmegaConf
@@ -53,70 +53,11 @@ class Fast3R(nn.Module,
         decoder_args: dict,
         head_args: dict,
         freeze="none",
-        # --- Course project experiments ---
-        # (A) Bottleneck: compress then restore to preserve interfaces.
-        use_dim_reduction: Optional[bool] = None,
-        dim_reduction_ratio: float = 0.5,
-        dim_reduction_alpha: Optional[float] = None,
-        dim_reduction_activation: str = "gelu",
-        dim_reduction_verbose: Optional[bool] = None,
-        # (B) Low-dim decoder: keep features low-dim for decoder/head to reduce compute.
-        #     This is a more "real" lightweight mode but will generally require finetuning.
-        use_lowdim_decoder: Optional[bool] = None,
-        lowdim_ratio: float = 0.5,
-        lowdim_verbose: Optional[bool] = None,
-        # (C) Token subsampling: reduce #patch tokens (N) after encoder.
-        #     This directly reduces attention cost (~N^2) but also lowers output resolution.
-        use_token_subsample: Optional[bool] = None,
-        token_subsample_stride: int = 2,
-        token_subsample_verbose: Optional[bool] = None,
     ):
         super(Fast3R, self).__init__()
 
         self.encoder_args = OmegaConf.to_container(encoder_args) if isinstance(encoder_args, DictConfig) else encoder_args
         self.build_encoder(encoder_args)
-
-        # Low-dim decoder flag must be decided before building decoder/head.
-        self.use_lowdim_decoder = (
-            self._parse_bool_env("FAST3R_USE_LOWDIM_DECODER", default=False)
-            if use_lowdim_decoder is None
-            else bool(use_lowdim_decoder)
-        )
-        # Allow env override for quick ablations in demo/inference scripts.
-        self.lowdim_ratio = float(os.environ.get("FAST3R_LOWDIM_RATIO", str(lowdim_ratio)))
-        self.lowdim_verbose = (
-            self._parse_bool_env("FAST3R_LOWDIM_VERBOSE", default=True)
-            if lowdim_verbose is None
-            else bool(lowdim_verbose)
-        )
-        self._lowdim_logged_once = False
-        self._lowdim_in_dim: Optional[int] = None
-        self._lowdim_dim: Optional[int] = None
-        self.lowdim_proj: Optional[nn.Linear] = None
-
-        enc_dim = None
-        if isinstance(self.encoder_args, dict):
-            enc_dim = self.encoder_args.get("embed_dim", None)
-        if enc_dim is None and hasattr(self.encoder, "model"):
-            enc_dim = getattr(self.encoder.model, "embed_dim", None)
-        if enc_dim is None:
-            # Fallback: some configs store encoder dim in decoder args.
-            enc_dim = decoder_args.get("enc_embed_dim", None) if isinstance(decoder_args, dict) else None
-        if isinstance(enc_dim, int) and enc_dim > 0:
-            self._init_lowdim_proj(enc_dim)
-
-        self.use_token_subsample = (
-            self._parse_bool_env("FAST3R_USE_TOKEN_SUBSAMPLE", default=False)
-            if use_token_subsample is None
-            else bool(use_token_subsample)
-        )
-        self.token_subsample_stride = int(os.environ.get("FAST3R_TOKEN_SUBSAMPLE_STRIDE", str(token_subsample_stride)))
-        self.token_subsample_verbose = (
-            self._parse_bool_env("FAST3R_TOKEN_SUBSAMPLE_VERBOSE", default=True)
-            if token_subsample_verbose is None
-            else bool(token_subsample_verbose)
-        )
-        self._token_subsample_logged_once = False
 
         self.decoder_args = OmegaConf.to_container(decoder_args) if isinstance(decoder_args, DictConfig) else decoder_args
         self.build_decoder(decoder_args)
@@ -126,278 +67,7 @@ class Fast3R(nn.Module,
 
         self.max_parallel_views_for_head = 25  # how many views to process in parallel in the head, used to avoid OOM
 
-        # ---------------------------------------------------------------------
-        # Course project: lightweight backbone experiment (minimal-intrusion)
-        #
-        # Insert a bottleneck right AFTER the encoder output:
-        #   encoder_feats -> Linear(D->D*r) -> activation -> Linear(D*r->D) -> decoder/fusion/head
-        #
-        # Rationale:
-        # - This is the smallest change that preserves downstream interfaces (decoder input dim stays D).
-        # - It enables an apples-to-apples comparison vs. the original model by flipping a single switch.
-        # - It tests the engineering feasibility of "feature compression" without refactoring the pipeline.
-        # ---------------------------------------------------------------------
-        # Note: low-dim decoder and "compress-then-restore" bottleneck are mutually exclusive.
-        if self.use_lowdim_decoder and (use_dim_reduction is True):
-            raise ValueError("use_lowdim_decoder=True is incompatible with use_dim_reduction=True")
-        if self.use_lowdim_decoder and use_dim_reduction is None:
-            use_dim_reduction = False
-
-        self.use_dim_reduction = (
-            self._parse_bool_env("FAST3R_USE_DIM_REDUCTION", default=False)
-            if use_dim_reduction is None
-            else bool(use_dim_reduction)
-        )
-        self.dim_reduction_ratio = float(dim_reduction_ratio)
-        self.dim_reduction_alpha = (
-            float(os.environ.get("FAST3R_DIM_REDUCTION_ALPHA", "1.0"))
-            if dim_reduction_alpha is None
-            else float(dim_reduction_alpha)
-        )
-        self.dim_reduction_verbose = (
-            self._parse_bool_env("FAST3R_DIM_REDUCTION_VERBOSE", default=True)
-            if dim_reduction_verbose is None
-            else bool(dim_reduction_verbose)
-        )
-        self._dim_reduction_status_logged_once = False
-        self._dim_reduction_shapes_logged_once = False
-
-        act = (dim_reduction_activation or "gelu").lower()
-        if act == "relu":
-            self.dim_reduction_act = nn.ReLU()
-        elif act == "gelu":
-            self.dim_reduction_act = nn.GELU()
-        else:
-            raise ValueError(f"Unsupported {dim_reduction_activation=}, expected 'relu' or 'gelu'")
-
-        self._dim_reduction_in_dim: Optional[int] = None
-        self._dim_reduction_hidden_dim: Optional[int] = None
-        self.dim_reduction: Optional[nn.Linear] = None
-        self.dim_restore: Optional[nn.Linear] = None
-
-        # Best-effort eager init (helps training/optimizers); falls back to lazy init in forward.
-        if self.use_dim_reduction:
-            enc_dim = None
-            if isinstance(self.encoder_args, dict):
-                enc_dim = self.encoder_args.get("embed_dim", None)
-            if enc_dim is None and hasattr(self.encoder, "model"):
-                enc_dim = getattr(self.encoder.model, "embed_dim", None)
-            if isinstance(enc_dim, int) and enc_dim > 0:
-                self._init_dim_reduction_layers(enc_dim)
-
         self.set_freeze(freeze)
-
-    @staticmethod
-    def _parse_bool_env(name: str, default: bool) -> bool:
-        val = os.environ.get(name, None)
-        if val is None:
-            return default
-        return val.strip().lower() in {"1", "true", "yes", "y", "on"}
-
-    def _init_lowdim_proj(self, in_dim: int, *, device=None, dtype=None) -> None:
-        if in_dim <= 0:
-            raise ValueError(f"Expected positive encoder feature dim, got {in_dim}")
-        if not (0.0 < self.lowdim_ratio <= 1.0):
-            raise ValueError(f"Expected 0 < lowdim_ratio <= 1, got {self.lowdim_ratio}")
-
-        lowdim_dim = max(1, int(round(in_dim * self.lowdim_ratio)))
-        if lowdim_dim > in_dim:
-            lowdim_dim = in_dim
-
-        self._lowdim_in_dim = int(in_dim)
-        self._lowdim_dim = int(lowdim_dim)
-
-        # Use a deterministic "channel truncation" projection to keep compatibility
-        # with a simple weight truncation strategy when loading pretrained checkpoints.
-        self.lowdim_proj = nn.Linear(in_dim, lowdim_dim, bias=False)
-        with torch.no_grad():
-            self.lowdim_proj.weight.zero_()
-            eye = torch.eye(in_dim, dtype=self.lowdim_proj.weight.dtype, device=self.lowdim_proj.weight.device)
-            self.lowdim_proj.weight.copy_(eye[:lowdim_dim])
-        if device is not None or dtype is not None:
-            self.lowdim_proj = self.lowdim_proj.to(device=device, dtype=dtype)
-
-    @staticmethod
-    def _choose_num_heads(target_dim: int, requested_heads: int) -> int:
-        if target_dim % requested_heads == 0:
-            return requested_heads
-        # Pick a divisor close to requested_heads.
-        for h in sorted({requested_heads, 16, 12, 8, 6, 4, 3, 2, 1}, reverse=True):
-            if h <= requested_heads and target_dim % h == 0:
-                return h
-        return 1
-
-    def _apply_lowdim_proj(self, encoded_feats: Union[Sequence[torch.Tensor], Tuple[torch.Tensor, ...]], *, profiling: bool = False):
-        if not self.use_lowdim_decoder:
-            return encoded_feats
-        if len(encoded_feats) == 0:
-            return encoded_feats
-        ref = encoded_feats[0]
-        if not isinstance(ref, torch.Tensor) or ref.ndim < 2:
-            return encoded_feats
-
-        in_dim = int(ref.shape[-1])
-        if self.lowdim_proj is None or self._lowdim_in_dim != in_dim:
-            self._init_lowdim_proj(in_dim, device=ref.device, dtype=ref.dtype)
-        assert self.lowdim_proj is not None
-
-        out_list = []
-        projected_shape = None
-        for idx, feat in enumerate(encoded_feats):
-            projected = self.lowdim_proj(feat)
-            out_list.append(projected)
-            if idx == 0:
-                projected_shape = tuple(projected.shape)
-
-        if self.lowdim_verbose and (profiling or not self._lowdim_logged_once):
-            if (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0:
-                print(
-                    f"[lowdim-decoder] enabled={self.use_lowdim_decoder} "
-                    f"encoder_feat={tuple(ref.shape)} -> lowdim_feat={projected_shape} "
-                    f"(D={in_dim}, d={self._lowdim_dim}, ratio={self.lowdim_ratio})"
-                )
-            self._lowdim_logged_once = True
-
-        return tuple(out_list) if isinstance(encoded_feats, tuple) else out_list
-
-    def _apply_token_subsample(
-        self,
-        encoded_feats: Union[Sequence[torch.Tensor], Tuple[torch.Tensor, ...]],
-        positions: Union[Sequence[torch.Tensor], Tuple[torch.Tensor, ...]],
-        shapes: Union[Sequence[torch.Tensor], Tuple[torch.Tensor, ...]],
-        *,
-        profiling: bool = False,
-    ):
-        """
-        Subsample patch tokens by taking a strided subset of the patch grid.
-        This reduces N (and attention cost), but also reduces the effective resolution.
-        """
-        if not self.use_token_subsample:
-            return encoded_feats, positions, shapes
-        stride = int(self.token_subsample_stride)
-        if stride <= 1:
-            return encoded_feats, positions, shapes
-        if len(encoded_feats) == 0:
-            return encoded_feats, positions, shapes
-
-        # Positions are (B, N, 2) integer patch coordinates.
-        # We pick a regular subset where both coords are divisible by stride.
-        out_feats, out_pos, out_shapes = [], [], []
-        ref_shape_before = None
-        ref_shape_after = None
-        for feat, pos, tshape in zip(encoded_feats, positions, shapes):
-            if not (isinstance(feat, torch.Tensor) and isinstance(pos, torch.Tensor) and isinstance(tshape, torch.Tensor)):
-                out_feats.append(feat)
-                out_pos.append(pos)
-                out_shapes.append(tshape)
-                continue
-            if pos.ndim != 3 or pos.shape[-1] != 2 or feat.ndim != 3:
-                out_feats.append(feat)
-                out_pos.append(pos)
-                out_shapes.append(tshape)
-                continue
-
-            # Assume all items in the batch share the same patch layout for this view.
-            pos0 = pos[0]  # (N, 2)
-            mask = (pos0[:, 0] % stride == 0) & (pos0[:, 1] % stride == 0)
-            feat_s = feat[:, mask]
-            pos_s = pos[:, mask]
-            # Reduce effective pixel resolution for downstream head reshaping.
-            shape_s = torch.div(tshape, stride, rounding_mode="floor")
-
-            out_feats.append(feat_s)
-            out_pos.append(pos_s)
-            out_shapes.append(shape_s)
-
-            if ref_shape_before is None:
-                ref_shape_before = tuple(feat.shape)
-                ref_shape_after = tuple(feat_s.shape)
-
-        if self.token_subsample_verbose and (profiling or not self._token_subsample_logged_once):
-            if (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0:
-                print(
-                    f"[token-subsample] enabled={self.use_token_subsample} stride={stride} "
-                    f"feat={ref_shape_before} -> {ref_shape_after}"
-                )
-            self._token_subsample_logged_once = True
-
-        return (
-            tuple(out_feats) if isinstance(encoded_feats, tuple) else out_feats,
-            tuple(out_pos) if isinstance(positions, tuple) else out_pos,
-            tuple(out_shapes) if isinstance(shapes, tuple) else out_shapes,
-        )
-
-    def _init_dim_reduction_layers(self, in_dim: int, *, device=None, dtype=None) -> None:
-        if in_dim <= 0:
-            raise ValueError(f"Expected positive encoder feature dim, got {in_dim}")
-        if not (0.0 < self.dim_reduction_ratio <= 1.0):
-            raise ValueError(f"Expected 0 < dim_reduction_ratio <= 1, got {self.dim_reduction_ratio}")
-
-        hidden_dim = max(1, int(round(in_dim * self.dim_reduction_ratio)))
-        if hidden_dim > in_dim:
-            hidden_dim = in_dim
-
-        self._dim_reduction_in_dim = int(in_dim)
-        self._dim_reduction_hidden_dim = int(hidden_dim)
-
-        self.dim_reduction = nn.Linear(in_dim, hidden_dim, bias=True)
-        self.dim_restore = nn.Linear(hidden_dim, in_dim, bias=True)
-        # Initialize to a stable low-rank projector (instead of random mixing),
-        # to avoid catastrophic degradation when running inference without finetuning.
-        with torch.no_grad():
-            nn.init.zeros_(self.dim_reduction.bias)
-            nn.init.zeros_(self.dim_restore.bias)
-            nn.init.orthogonal_(self.dim_reduction.weight)  # rows are orthonormal when hidden_dim <= in_dim
-            self.dim_restore.weight.copy_(self.dim_reduction.weight.t())
-        if device is not None or dtype is not None:
-            self.dim_reduction = self.dim_reduction.to(device=device, dtype=dtype)
-            self.dim_restore = self.dim_restore.to(device=device, dtype=dtype)
-
-    def _apply_dim_reduction_bottleneck(
-        self, encoded_feats: Union[Sequence[torch.Tensor], Tuple[torch.Tensor, ...]], *, profiling: bool = False
-    ):
-        if not self.use_dim_reduction:
-            return encoded_feats
-        if len(encoded_feats) == 0:
-            return encoded_feats
-
-        ref = encoded_feats[0]
-        if not isinstance(ref, torch.Tensor) or ref.ndim < 2:
-            return encoded_feats
-
-        in_dim = int(ref.shape[-1])
-        if self.dim_reduction is None or self.dim_restore is None or self._dim_reduction_in_dim != in_dim:
-            self._init_dim_reduction_layers(in_dim, device=ref.device, dtype=ref.dtype)
-
-        reduced_shape = None
-        restored_shape = None
-        out_list = []
-        for idx, feat in enumerate(encoded_feats):
-            reduced = self.dim_reduction(feat)
-            reduced = self.dim_reduction_act(reduced)
-            restored = self.dim_restore(reduced)
-            if self.dim_reduction_alpha != 1.0:
-                # AMP may produce different dtypes for `feat` (encoder output) and `restored` (linear output).
-                # `torch.lerp` requires matching dtypes for start/end.
-                if restored.dtype != feat.dtype:
-                    restored = restored.to(dtype=feat.dtype)
-                restored = torch.lerp(feat, restored, self.dim_reduction_alpha)
-            out_list.append(restored)
-            if idx == 0:
-                reduced_shape = tuple(reduced.shape)
-                restored_shape = tuple(restored.shape)
-
-        if self.dim_reduction_verbose and (profiling or not self._dim_reduction_shapes_logged_once):
-            # Keep logs concise: print shapes for a representative view only.
-            if (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0:
-                print(
-                    f"[dim-reduction] enabled={self.use_dim_reduction} "
-                    f"encoder_feat={tuple(ref.shape)} -> reduced={reduced_shape} -> restored={restored_shape} "
-                    f"(D={in_dim}, hidden={self._dim_reduction_hidden_dim}, ratio={self.dim_reduction_ratio}, alpha={self.dim_reduction_alpha})"
-                )
-            self._dim_reduction_shapes_logged_once = True
-
-        return tuple(out_list) if isinstance(encoded_feats, tuple) else out_list
 
     def build_encoder(self, encoder_args: dict):
         # Initialize the encoder based on the encoder type
@@ -419,20 +89,6 @@ class Fast3R(nn.Module,
         if decoder_args["decoder_type"] == 'fast3r':
             decoder_args = deepcopy(decoder_args)
             decoder_args.pop('decoder_type')
-            if self.use_lowdim_decoder:
-                # Course project: keep the whole decoder/head width at low-dim for speed.
-                # This changes parameter shapes; pretrained checkpoints are loaded via truncation.
-                in_dim = self._lowdim_dim or decoder_args.get("enc_embed_dim", None) or self.encoder_args.get("embed_dim", None)
-                if not isinstance(in_dim, int) or in_dim <= 0:
-                    raise ValueError("Cannot infer low-dim width for decoder; please set encoder_args.embed_dim")
-                decoder_args["enc_embed_dim"] = in_dim
-                decoder_args["embed_dim"] = in_dim
-                decoder_args["num_heads"] = self._choose_num_heads(in_dim, int(decoder_args.get("num_heads", 12)))
-                # Keep the stored args consistent for head_factory/profiling/logging.
-                if isinstance(self.decoder_args, dict):
-                    self.decoder_args["enc_embed_dim"] = decoder_args["enc_embed_dim"]
-                    self.decoder_args["embed_dim"] = decoder_args["embed_dim"]
-                    self.decoder_args["num_heads"] = decoder_args["num_heads"]
             self.decoder = Fast3RDecoder(**decoder_args)
         elif decoder_args["decoder_type"] == 'llama':
             decoder_args = deepcopy(decoder_args)
@@ -483,16 +139,7 @@ class Fast3R(nn.Module,
             feature_dim = 256
             last_dim = feature_dim // 2
             out_nchan = 3
-            if self.use_lowdim_decoder and self._lowdim_dim is not None:
-                ed = self._lowdim_dim
-            else:
-                ed = None
-                if isinstance(self.encoder_args, dict):
-                    ed = self.encoder_args.get("embed_dim", None)
-                if ed is None and hasattr(self.encoder, "model"):
-                    ed = getattr(self.encoder.model, "embed_dim", None)
-                if not isinstance(ed, int):
-                    raise ValueError("Cannot infer encoder embed dim for head; please set encoder_args.embed_dim")
+            ed = self.encoder_args["embed_dim"]
             dd = self.decoder_args["embed_dim"]
             return PixelwiseTaskWithDPT(
                 num_channels=out_nchan + has_conf,
@@ -510,105 +157,7 @@ class Fast3R(nn.Module,
             raise NotImplementedError(f"unexpected {head_type=} and {output_mode=}")
 
     def load_state_dict(self, ckpt, **kw):
-        # Backward/forward compatible loading:
-        # - Old checkpoints won't have the course-project dim-reduction parameters.
-        # - New checkpoints might include them, while older code/models might not.
-        strict = kw.pop("strict", True)
-
-        # If low-dim decoder is enabled, truncate compatible weights from a full-width checkpoint.
-        if self.use_lowdim_decoder:
-            ckpt = self._truncate_checkpoint_for_lowdim(ckpt)
-
-        res = super().load_state_dict(ckpt, strict=False, **kw)
-        if not strict:
-            return res
-
-        allowed_prefixes = ("dim_reduction.", "dim_restore.", "lowdim_proj.")
-        missing = [k for k in res.missing_keys if not k.startswith(allowed_prefixes)]
-        unexpected = [k for k in res.unexpected_keys if not k.startswith(allowed_prefixes)]
-        if missing or unexpected:
-            raise RuntimeError(
-                "Error(s) in loading state_dict for Fast3R:\n"
-                + (f"\tMissing key(s) in state_dict: {missing}\n" if missing else "")
-                + (f"\tUnexpected key(s) in state_dict: {unexpected}\n" if unexpected else "")
-            )
-        return res
-
-    def _truncate_checkpoint_for_lowdim(self, ckpt: dict) -> dict:
-        """
-        Truncate a full-width checkpoint to fit a low-dim decoder/head.
-        This is a best-effort conversion for inference-only experimentation.
-        """
-        d = self._lowdim_dim
-        if not isinstance(d, int) or d <= 0:
-            return ckpt
-
-        def _slice_1d(x: torch.Tensor, n: int) -> torch.Tensor:
-            return x[:n].contiguous()
-
-        def _slice_2d(x: torch.Tensor, n0: int, n1: int) -> torch.Tensor:
-            return x[:n0, :n1].contiguous()
-
-        def _slice_conv1x1_in(x: torch.Tensor, n_in: int) -> torch.Tensor:
-            # (out, in, 1, 1)
-            return x[:, :n_in, :, :].contiguous()
-
-        new_ckpt = {}
-        for k, v in ckpt.items():
-            if not isinstance(v, torch.Tensor):
-                new_ckpt[k] = v
-                continue
-
-            # Decoder
-            if k == "decoder.decoder_embed.weight":
-                new_ckpt[k] = _slice_2d(v, d, d)
-                continue
-            if k == "decoder.decoder_embed.bias":
-                new_ckpt[k] = _slice_1d(v, d)
-                continue
-            if k.startswith("decoder.dec_blocks."):
-                if k.endswith(("norm1.weight", "norm1.bias", "norm2.weight", "norm2.bias")):
-                    new_ckpt[k] = _slice_1d(v, d)
-                    continue
-                if k.endswith("attn.qkv.weight"):
-                    new_ckpt[k] = _slice_2d(v, 3 * d, d)
-                    continue
-                if k.endswith("attn.qkv.bias"):
-                    new_ckpt[k] = _slice_1d(v, 3 * d)
-                    continue
-                if k.endswith("attn.proj.weight"):
-                    new_ckpt[k] = _slice_2d(v, d, d)
-                    continue
-                if k.endswith("attn.proj.bias"):
-                    new_ckpt[k] = _slice_1d(v, d)
-                    continue
-                if k.endswith("mlp.fc1.weight"):
-                    hidden = self.decoder.dec_blocks[0].mlp.fc1.weight.shape[0]
-                    new_ckpt[k] = _slice_2d(v, hidden, d)
-                    continue
-                if k.endswith("mlp.fc1.bias"):
-                    hidden = self.decoder.dec_blocks[0].mlp.fc1.weight.shape[0]
-                    new_ckpt[k] = _slice_1d(v, hidden)
-                    continue
-                if k.endswith("mlp.fc2.weight"):
-                    hidden = self.decoder.dec_blocks[0].mlp.fc1.weight.shape[0]
-                    new_ckpt[k] = _slice_2d(v, d, hidden)
-                    continue
-                if k.endswith("mlp.fc2.bias"):
-                    new_ckpt[k] = _slice_1d(v, d)
-                    continue
-            if k == "decoder.dec_norm.weight" or k == "decoder.dec_norm.bias":
-                new_ckpt[k] = _slice_1d(v, d)
-                continue
-
-            # DPT head: truncate 1x1 convs that take token channels as input
-            if ".dpt.act_postprocess." in k and k.endswith(".0.weight") and v.ndim == 4 and v.shape[2:] == (1, 1):
-                new_ckpt[k] = _slice_conv1x1_in(v, d)
-                continue
-
-            new_ckpt[k] = v
-
-        return new_ckpt
+        return super().load_state_dict(ckpt, **kw)
 
     def load_from_dust3r_checkpoint(self, dust3r_checkpoint_path: str):
         """Load a Dust3R checkpoint into the model.
@@ -777,25 +326,6 @@ class Fast3R(nn.Module,
             # print the image and true_shape
            # for view_idx, view in enumerate(views):
                # print(f"view_idx: {view_idx}\n, view name: {view_name(view)}\n, image content: {view['img']}\n, true_shape: {view['true_shape']}")
-
-        if self.use_lowdim_decoder and self.lowdim_verbose and (profiling or not self._lowdim_logged_once):
-            if (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0:
-                print(f"[lowdim-decoder] enabled={self.use_lowdim_decoder}")
-        if self.dim_reduction_verbose and (profiling or not self._dim_reduction_status_logged_once):
-            if (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0:
-                print(f"[dim-reduction] enabled={self.use_dim_reduction}")
-            self._dim_reduction_status_logged_once = True
-
-        # Course project experiment (B): keep features low-dim into decoder/head.
-        encoded_feats = self._apply_lowdim_proj(encoded_feats, profiling=profiling)
-
-        # Course project experiment (C): reduce #patch tokens after encoder.
-        encoded_feats, positions, shapes = self._apply_token_subsample(
-            encoded_feats, positions, shapes, profiling=profiling
-        )
-
-        # Course project experiment: bottleneck right after encoder output (before decoder).
-        encoded_feats = self._apply_dim_reduction_bottleneck(encoded_feats, profiling=profiling)
 
         # Create image IDs for each patch
         pos_emb_start_time = time.time()

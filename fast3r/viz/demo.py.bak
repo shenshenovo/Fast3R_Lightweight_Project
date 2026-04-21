@@ -31,60 +31,6 @@ from fast3r.utils.checkpoint_utils import load_model
 global_manager_req_queue = None
 global_manager_resp_queue = None
 
-
-def _safe_nanmean(x: torch.Tensor) -> float:
-    x = x.float()
-    if hasattr(torch, "nanmean"):
-        return float(torch.nanmean(x).item())
-    return float(x[torch.isfinite(x)].mean().item()) if torch.isfinite(x).any() else float("nan")
-
-
-def _summarize_preds_metrics(preds, max_views_to_print: int = 10) -> str:
-    """
-    Lightweight numeric summary for report-friendly comparisons.
-    Prints per-view (limited) and aggregate:
-    - valid_ratio: fraction of finite 3D points
-    - conf_mean: mean confidence (if available)
-    - median_norm: median ||pts3d|| as a rough scale sanity check
-    """
-    per_view = []
-    for i, pred in enumerate(preds):
-        pts = None
-        for k in ("pts3d_local", "pts3d_in_other_view", "pts3d"):
-            if k in pred and isinstance(pred[k], torch.Tensor):
-                pts = pred[k]
-                break
-        if pts is None or pts.numel() == 0:
-            continue
-
-        finite = torch.isfinite(pts).all(dim=-1)
-        valid_ratio = float(finite.float().mean().item())
-
-        conf = None
-        for ck in ("conf_local", "conf"):
-            if ck in pred and isinstance(pred[ck], torch.Tensor):
-                conf = pred[ck]
-                break
-        conf_mean = _safe_nanmean(conf) if conf is not None else float("nan")
-
-        norm = torch.linalg.vector_norm(pts.float(), dim=-1)
-        median_norm = float(torch.nanmedian(norm).item()) if hasattr(torch, "nanmedian") else float(norm[finite].median().item())
-
-        per_view.append((valid_ratio, conf_mean, median_norm))
-        if len(per_view) >= max_views_to_print:
-            break
-
-    if not per_view:
-        return "metrics: (no pts3d found)"
-
-    vr = sum(x[0] for x in per_view) / len(per_view)
-    cm = sum(x[1] for x in per_view if x[1] == x[1]) / max(1, sum(1 for x in per_view if x[1] == x[1]))
-    mn = sum(x[2] for x in per_view) / len(per_view)
-    msg = f"metrics (first {len(per_view)} views): valid_ratio={vr:.3f}, conf_mean={cm:.3f}, median_norm={mn:.3f}"
-    if len(preds) > len(per_view):
-        msg += f" (total_views={len(preds)})"
-    return msg
-
 # -------------------------------
 # run_viser_server
 # -------------------------------
@@ -99,7 +45,7 @@ def run_viser_server(pipe_conn, output, min_conf_thr_percentile, global_conf_thr
             global_conf_thr_value_to_drop_view=global_conf_thr_value_to_drop_view,
             point_size=point_size,
         )
-        share_url = None
+        share_url = server.request_share_url()
         pipe_conn.send({"share_url": share_url})
         pipe_conn.close()
         while True:
@@ -471,9 +417,6 @@ def process_images(uploaded_files, video_file, state,
     )
     
     # Run inference directly
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-        torch.cuda.reset_peak_memory_stats()
     output_dict, profiling_info = inference(
         imgs,
         model,
@@ -483,31 +426,14 @@ def process_images(uploaded_files, video_file, state,
         verbose=True,
         profiling=True,
     )
-    peak_alloc_gb = None
-    peak_reserved_gb = None
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-        peak_alloc_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
-        peak_reserved_gb = torch.cuda.max_memory_reserved() / (1024 ** 3)
     model_forward_time = profiling_info['total_time']
-    preds_metrics_msg = _summarize_preds_metrics(output_dict.get("preds", []))
-    if peak_alloc_gb is not None:
-        print(f"[mem] peak_allocated_GB={peak_alloc_gb:.2f}, peak_reserved_GB={peak_reserved_gb:.2f}")
-    print(f"[preds] {preds_metrics_msg}")
 
     yield (
         gr.update(),
         gr.update(),
         gr.update(),
         gr.update(),
-        (
-            f"Processing {len(filelist)} images...\n"
-            f"Image loading and cropping time: {load_time:.2f} sec.\n"
-            f"Model inference time: {model_forward_time:.2f} sec.\n"
-            + (f"Peak VRAM allocated: {peak_alloc_gb:.2f} GB (reserved {peak_reserved_gb:.2f} GB)\n" if peak_alloc_gb is not None else "")
-            + f"{preds_metrics_msg}\n"
-            f"Preparing visualization..."
-        ),
+        f"Processing {len(filelist)} images...\nImage loading and cropping time: {load_time:.2f} sec.\nModel inference time: {model_forward_time:.2f} sec.\nPreparing visualization...",
         state,
     )
     
