@@ -20,10 +20,12 @@ Official implementation of **Fast3R: Towards 3D Reconstruction of 1000+ Images i
 
 ## Installation
 
+This repo is used for a course lightweight experiment fork. For a teacher-friendly, from-scratch setup (ZIP download or `git clone`), see `INSTALL.md`.
+
 ```bash
 # clone project
-git clone https://github.com/facebookresearch/fast3r
-cd fast3r
+git clone https://github.com/shenshenovo/Fast3R_Lightweight_Project.git
+cd Fast3R_Lightweight_Project
 
 # create conda environment
 conda create -n fast3r python=3.11 cmake=3.14.0 -y
