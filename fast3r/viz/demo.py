@@ -288,6 +288,16 @@ class ViserServerManager:
 # -------------------------------
 # start_manager
 # -------------------------------
+def run_viser_server_manager(req_queue, resp_queue):
+    """Entry point for the manager process.
+
+    Windows uses spawn multiprocessing, so the Process target must be a
+    top-level function with pickleable arguments. Creating ViserServerManager
+    inside the child avoids pickling rich.Console and its internal lock.
+    """
+    ViserServerManager(req_queue, resp_queue).run()
+
+
 def start_manager():
     """
     Starts the ViserServerManager.
@@ -296,7 +306,7 @@ def start_manager():
     """
     req_queue = mp.Queue()
     resp_queue = mp.Queue()
-    manager_process = mp.Process(target=ViserServerManager(req_queue, resp_queue).run)
+    manager_process = mp.Process(target=run_viser_server_manager, args=(req_queue, resp_queue))
     manager_process.start()
     return req_queue, resp_queue, manager_process
 
@@ -1039,7 +1049,7 @@ def create_demo(checkpoint_dir, examples_dir, output_dir, device: torch.device, 
         gr.HTML(header_html)
         with gr.Row():
             with gr.Column(scale=2):
-                gallery = gr.Gallery(label="Upload Images of a Scene", columns=6, height="150px", show_download_button=True)
+                gallery = gr.Gallery(label="Upload Images of a Scene", columns=6, height="150px")
                 video_input.render()
             with gr.Column(scale=1):
                 # Add resolution radio button
@@ -1199,7 +1209,8 @@ def main():
     demo = create_demo(args.checkpoint_dir, args.examples_dir, args.output_dir, device=device, 
                        is_lightning_checkpoint=args.is_lightning_checkpoint)
     demo.queue(default_concurrency_limit=2)
-    demo.launch(share=True)
+    demo.launch(share=False, server_name="127.0.0.1", server_port=7860)
 
 if __name__ == "__main__":
     main()
+

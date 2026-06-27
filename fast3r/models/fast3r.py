@@ -302,8 +302,14 @@ class Fast3R(nn.Module,
             mask = (pos0[:, 0] % stride == 0) & (pos0[:, 1] % stride == 0)
             feat_s = feat[:, mask]
             pos_s = pos[:, mask]
-            # Reduce effective pixel resolution for downstream head reshaping.
-            shape_s = torch.div(tshape, stride, rounding_mode="floor")
+            # Match downstream head reshaping to the compact sampled token grid.
+            # Example: 224px with 16px patches gives 14 tokens per side; stride=4
+            # keeps original coordinates 0,4,8,12, i.e. 4 compact rows/cols.
+            patch = int(getattr(self, "patch_size", 16))
+            pos0_s = pos0[mask]
+            sampled_h = int(torch.unique(pos0_s[:, 0]).numel())
+            sampled_w = int(torch.unique(pos0_s[:, 1]).numel())
+            shape_s = tshape.new_tensor([sampled_h * patch, sampled_w * patch]).unsqueeze(0).repeat(tshape.shape[0], 1)
 
             out_feats.append(feat_s)
             out_pos.append(pos_s)
@@ -1169,6 +1175,17 @@ class Fast3RDecoder(nn.Module):
         # final norm layer
         self.dec_norm = norm_layer(embed_dim)
 
+    def _ensure_image_idx_emb(self, num_images: int, device: torch.device):
+        if num_images <= self.image_idx_emb.shape[0]:
+            self.image_idx_emb = self.image_idx_emb.to(device=device)
+            return
+
+        self.image_idx_emb = torch.from_numpy(
+            get_1d_sincos_pos_embed_from_grid(
+                self.image_idx_emb.shape[1], np.arange(num_images)
+            )
+        ).float().to(device=device)
+
     def _generate_per_rank_generator(self):
         # this way, the randperm will be different for each rank, but deterministic given a fixed number of forward passes (tracked by self.random_generator)
         # and to ensure determinism when resuming from a checkpoint, we only need to save self.random_generator to state_dict
@@ -1253,6 +1270,7 @@ class Fast3RDecoder(nn.Module):
 
         # Add positional embedding based on image IDs
         if self.random_image_idx_embedding:
+            self._ensure_image_idx_emb(len(encoded_feats), x.device)
             # Generate random positional embeddings for all views and samples
             image_pos = self._get_random_image_pos(encoded_feats=encoded_feats,
                                                    batch_size=encoded_feats[0].shape[0],
@@ -1261,10 +1279,10 @@ class Fast3RDecoder(nn.Module):
                                                    device=x.device)
         else:
             # Use default image IDs from input
-            num_images = (torch.max(image_ids) + 1).cpu().item()
+            num_images = int((torch.max(image_ids) + 1).cpu().item())
+            self._ensure_image_idx_emb(num_images, x.device)
             image_idx_emb = self.image_idx_emb[:num_images]
             image_pos = image_idx_emb[image_ids]
-
         # Apply positional embedding based on image IDs and positions
         x += image_pos  # x has size B x Npatches x D, image_pos has size Npatches x D, so this is broadcasting
 
@@ -1331,6 +1349,15 @@ class LlamaDecoder(nn.Module):
             max_seq_len,
             self.rope_theta,
         )
+
+    def _ensure_precomputed_freqs_cis(self, num_images: int, device: torch.device):
+        if num_images <= self.precomputed_freqs_cis.shape[0]:
+            self.precomputed_freqs_cis = self.precomputed_freqs_cis.to(device=device)
+            return
+
+        self.precomputed_freqs_cis = self._precompute_freqs_cis(
+            max_seq_len=num_images
+        ).to(device=device)
 
     def _generate_per_rank_generator(self):
         # Generate a per-rank random seed
@@ -1406,6 +1433,7 @@ class LlamaDecoder(nn.Module):
 
         # Generate freqs_cis based on image_ids
         if self.random_image_idx_embedding:
+            self._ensure_precomputed_freqs_cis(len(encoded_feats), device)
             freqs_cis = self._get_random_freqs_cis(
                 encoded_feats=encoded_feats,
                 batch_size=batch_size,
@@ -1415,11 +1443,10 @@ class LlamaDecoder(nn.Module):
             )
         else:
             # Use image_ids to index into precomputed_freqs_cis
-            num_images = (torch.max(image_ids) + 1).cpu().item()
-            self.precomputed_freqs_cis = self.precomputed_freqs_cis.to(device=device)
+            num_images = int((torch.max(image_ids) + 1).cpu().item())
+            self._ensure_precomputed_freqs_cis(num_images, device)
             image_idx_emb = self.precomputed_freqs_cis[:num_images]
             freqs_cis = image_idx_emb[image_ids]
-
         # Create a mask for view 0 patches
         view0_mask = (image_ids == 0).unsqueeze(-1).float()  # Shape: (batch_size, total_num_patches, 1)
 
