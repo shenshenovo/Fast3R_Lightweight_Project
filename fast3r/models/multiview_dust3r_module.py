@@ -548,6 +548,99 @@ class MultiViewDUSt3RLitModule(LightningModule):
             # Stack the aligned points back into a tensor of shape (B, H, W, 3)
             pred['pts3d_local_aligned_to_global'] = torch.stack(aligned_pts_dict[view_index], dim=0)
 
+    def align_local_pairwise(self, preds, views, min_conf_thr_percentile=85):
+        """
+        Pairwise chain alignment for LAF mode.
+
+        Registers pts3d_local of adjacent views. Adjacent views share visual
+        content, so their local point clouds have overlapping geometry.
+        Starting from view 0 (aligned to its own pts3d_in_other_view as anchor),
+        we chain pairwise transforms to get global poses.
+
+        Uses lower effective threshold (more points) and composes scale-aware
+        transforms for better chain stability.
+        """
+        num_views = len(preds)
+        B = preds[0]['pts3d_local'].shape[0]
+        device = preds[0]['pts3d_local'].device
+
+        for pred in preds:
+            if 'pts3d_local_aligned_to_global' not in pred:
+                pred['pts3d_local_aligned_to_global'] = torch.zeros_like(pred['pts3d_local'])
+
+        for batch_index in range(B):
+            # --- View 0: use its own pts3d_in_other_view as reference ---
+            pts_loc = preds[0]['pts3d_local'][batch_index]
+            pts_glo = preds[0]['pts3d_in_other_view'][batch_index]
+            conf0 = preds[0]['conf'][batch_index]
+            H0, W0 = pts_loc.shape[:2]
+
+            thr = torch.quantile(conf0.reshape(-1), min_conf_thr_percentile / 100.0)
+            mask = (conf0 >= thr).reshape(-1)
+            x0 = pts_loc.reshape(-1, 3)[mask]
+            y0 = pts_glo.reshape(-1, 3)[mask]
+
+            if x0.shape[0] >= 16:
+                R_cum, t_cum, s_cum = roma.rigid_points_registration(x0, y0, compute_scaling=True)
+            else:
+                R_cum = torch.eye(3, device=device, dtype=pts_loc.dtype)
+                t_cum = torch.zeros(3, device=device, dtype=pts_loc.dtype)
+                s_cum = torch.tensor(1.0, device=device, dtype=pts_loc.dtype)
+
+            flat0 = pts_loc.reshape(-1, 3)
+            preds[0]['pts3d_local_aligned_to_global'][batch_index] = (
+                s_cum * (flat0 @ R_cum.T) + t_cum
+            ).reshape(H0, W0, 3)
+
+            # Reference for chain: view 0's aligned local points
+            ref_pts = preds[0]['pts3d_local_aligned_to_global'][batch_index]
+            ref_conf = conf0
+
+            # --- Chain pairwise: view i's local → view i-1's aligned local ---
+            for i in range(1, num_views):
+                pts_loc_i = preds[i]['pts3d_local'][batch_index]
+                conf_i = preds[i].get('conf_local', preds[i].get('conf'))
+                if conf_i is None:
+                    conf_i = torch.ones(pts_loc_i.shape[:2], device=device)
+                else:
+                    conf_i = conf_i[batch_index]
+                Hi, Wi = pts_loc_i.shape[:2]
+
+                # Use wider threshold for more registration points
+                thr_i = torch.quantile(conf_i.reshape(-1), min_conf_thr_percentile / 100.0)
+                thr_ref = torch.quantile(ref_conf.reshape(-1), min_conf_thr_percentile / 100.0)
+
+                mask_i = (conf_i >= thr_i).reshape(-1)
+                mask_ref = (ref_conf >= thr_ref).reshape(-1)
+
+                x = pts_loc_i.reshape(-1, 3)[mask_i]    # source: view i local
+                y = ref_pts.reshape(-1, 3)[mask_ref]     # target: view i-1 aligned
+
+                n = max(min(x.shape[0], y.shape[0]), 1)
+                if n >= 16:
+                    if x.shape[0] > n:
+                        idx = torch.randperm(x.shape[0], device=device)[:n]
+                        x = x[idx]
+                    if y.shape[0] > n:
+                        idx = torch.randperm(y.shape[0], device=device)[:n]
+                        y = y[idx]
+                    R_rel, t_rel, s_rel = roma.rigid_points_registration(
+                        x, y, compute_scaling=True,
+                    )
+                    # Compose: frame i → frame i-1 → global
+                    R_cum_old = R_cum.clone()
+                    s_cum_old = s_cum.clone()
+                    R_cum = R_cum_old @ R_rel
+                    t_cum = s_cum_old * (R_cum_old @ t_rel) + t_cum
+                    s_cum = s_cum_old * s_rel
+                # else: keep previous accumulated transform
+
+                aligned_i = s_cum * (pts_loc_i.reshape(-1, 3) @ R_cum.T) + t_cum
+                preds[i]['pts3d_local_aligned_to_global'][batch_index] = aligned_i.reshape(Hi, Wi, 3)
+
+                ref_pts = aligned_i.reshape(Hi, Wi, 3)
+                ref_conf = conf_i
+
     def evaluate_reconstruction(self, views, preds, dataset_name,
                                 min_conf_thr_percentile_for_local_alignment_and_icp=0,
                                 min_conf_thr_percentile_for_metric_cacluation=0,

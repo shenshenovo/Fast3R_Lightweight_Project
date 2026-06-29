@@ -31,60 +31,6 @@ from fast3r.utils.checkpoint_utils import load_model
 global_manager_req_queue = None
 global_manager_resp_queue = None
 
-
-def _safe_nanmean(x: torch.Tensor) -> float:
-    x = x.float()
-    if hasattr(torch, "nanmean"):
-        return float(torch.nanmean(x).item())
-    return float(x[torch.isfinite(x)].mean().item()) if torch.isfinite(x).any() else float("nan")
-
-
-def _summarize_preds_metrics(preds, max_views_to_print: int = 10) -> str:
-    """
-    Lightweight numeric summary for report-friendly comparisons.
-    Prints per-view (limited) and aggregate:
-    - valid_ratio: fraction of finite 3D points
-    - conf_mean: mean confidence (if available)
-    - median_norm: median ||pts3d|| as a rough scale sanity check
-    """
-    per_view = []
-    for i, pred in enumerate(preds):
-        pts = None
-        for k in ("pts3d_local", "pts3d_in_other_view", "pts3d"):
-            if k in pred and isinstance(pred[k], torch.Tensor):
-                pts = pred[k]
-                break
-        if pts is None or pts.numel() == 0:
-            continue
-
-        finite = torch.isfinite(pts).all(dim=-1)
-        valid_ratio = float(finite.float().mean().item())
-
-        conf = None
-        for ck in ("conf_local", "conf"):
-            if ck in pred and isinstance(pred[ck], torch.Tensor):
-                conf = pred[ck]
-                break
-        conf_mean = _safe_nanmean(conf) if conf is not None else float("nan")
-
-        norm = torch.linalg.vector_norm(pts.float(), dim=-1)
-        median_norm = float(torch.nanmedian(norm).item()) if hasattr(torch, "nanmedian") else float(norm[finite].median().item())
-
-        per_view.append((valid_ratio, conf_mean, median_norm))
-        if len(per_view) >= max_views_to_print:
-            break
-
-    if not per_view:
-        return "metrics: (no pts3d found)"
-
-    vr = sum(x[0] for x in per_view) / len(per_view)
-    cm = sum(x[1] for x in per_view if x[1] == x[1]) / max(1, sum(1 for x in per_view if x[1] == x[1]))
-    mn = sum(x[2] for x in per_view) / len(per_view)
-    msg = f"metrics (first {len(per_view)} views): valid_ratio={vr:.3f}, conf_mean={cm:.3f}, median_norm={mn:.3f}"
-    if len(preds) > len(per_view):
-        msg += f" (total_views={len(preds)})"
-    return msg
-
 # -------------------------------
 # run_viser_server
 # -------------------------------
@@ -99,7 +45,7 @@ def run_viser_server(pipe_conn, output, min_conf_thr_percentile, global_conf_thr
             global_conf_thr_value_to_drop_view=global_conf_thr_value_to_drop_view,
             point_size=point_size,
         )
-        share_url = None
+        share_url = f"http://127.0.0.1:8020"
         pipe_conn.send({"share_url": share_url})
         pipe_conn.close()
         while True:
@@ -324,9 +270,9 @@ def update_gallery(files):
 # -------------------------------
 def process_images(uploaded_files, video_file, state,
                    model, lit_module, device,
-                   global_manager_req_queue, global_manager_resp_queue, 
+                   global_manager_req_queue, global_manager_resp_queue,
                    output_dir, examples_dir,
-                   image_size=512, rotate_clockwise_90=False, crop_to_landscape=False):
+                   image_size=512, laf_k=2, rotate_clockwise_90=False, crop_to_landscape=False):
     """
     Processes input images/video:
       - Saves files to the output directory (unless it's an example)
@@ -460,54 +406,55 @@ def process_images(uploaded_files, video_file, state,
     end_load_time = time.time()
     load_time = end_load_time - start_load_time
     print(f"Image loading and cropping time: {load_time:.2f} seconds")
-    
-    yield (
-        gr.update(),
-        gr.update(),
-        gr.update(),
-        gr.update(),
-        f"Processing {len(filelist)} images...\nImage loading and cropping time: {load_time:.2f} sec.\nRunning model inference...",
-        state,
-    )
-    
-    # Run inference directly
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-        torch.cuda.reset_peak_memory_stats()
-    output_dict, profiling_info = inference(
-        imgs,
-        model,
-        device,
-        dtype=torch.float32,
-        # dtype=torch.bfloat16,
-        verbose=True,
-        profiling=True,
-    )
-    peak_alloc_gb = None
-    peak_reserved_gb = None
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-        peak_alloc_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
-        peak_reserved_gb = torch.cuda.max_memory_reserved() / (1024 ** 3)
-    model_forward_time = profiling_info['total_time']
-    preds_metrics_msg = _summarize_preds_metrics(output_dict.get("preds", []))
-    if peak_alloc_gb is not None:
-        print(f"[mem] peak_allocated_GB={peak_alloc_gb:.2f}, peak_reserved_GB={peak_reserved_gb:.2f}")
-    print(f"[preds] {preds_metrics_msg}")
+
+    # Configure LAF mode
+    model.set_laf_k(laf_k)
+    num_imgs = len(imgs)
+    if laf_k > 0 and num_imgs > 50:
+        model.encoder_chunk_size = min(num_imgs, 20)
+    else:
+        model.encoder_chunk_size = 400
+    laf_label = {0: "Dense", 1: "LAF k=1", 2: "LAF k=2", 5: "LAF k=5"}.get(laf_k, f"LAF k={laf_k}")
 
     yield (
         gr.update(),
         gr.update(),
         gr.update(),
         gr.update(),
-        (
-            f"Processing {len(filelist)} images...\n"
-            f"Image loading and cropping time: {load_time:.2f} sec.\n"
-            f"Model inference time: {model_forward_time:.2f} sec.\n"
-            + (f"Peak VRAM allocated: {peak_alloc_gb:.2f} GB (reserved {peak_reserved_gb:.2f} GB)\n" if peak_alloc_gb is not None else "")
-            + f"{preds_metrics_msg}\n"
-            f"Preparing visualization..."
-        ),
+        f"Processing {len(filelist)} images...\nImage loading and cropping time: {load_time:.2f} sec.\nRunning model inference ({laf_label})...",
+        state,
+    )
+
+    # Reset peak memory stats before inference
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+        mem_before = torch.cuda.memory_allocated() / 1024**2
+
+    # Run inference directly
+    # 使用 bfloat16 来节省显存，RTX 4060 支持
+    print(f"Running inference with {laf_label}, {num_imgs} images, encoder_chunk_size={model.encoder_chunk_size}")
+    output_dict, profiling_info = inference(
+        imgs,
+        model,
+        device,
+        dtype=torch.bfloat16,
+        verbose=True,
+        profiling=True,
+    )
+    model_forward_time = profiling_info['total_time']
+
+    # Capture peak GPU memory
+    peak_memory_mb = 0
+    if device.type == "cuda":
+        peak_memory_mb = torch.cuda.max_memory_allocated() / 1024**2
+        print(f"Peak GPU memory: {peak_memory_mb:.0f} MiB")
+
+    yield (
+        gr.update(),
+        gr.update(),
+        gr.update(),
+        gr.update(),
+        f"Processing {len(filelist)} images...\nImage loading and cropping time: {load_time:.2f} sec.\nModel inference time: {model_forward_time:.2f} sec.\nPreparing visualization...",
         state,
     )
     
@@ -528,11 +475,21 @@ def process_images(uploaded_files, video_file, state,
     
     # Align points.
     start_vis_prep = time.time()
-    lit_module.align_local_pts3d_to_global(
-        preds=output_dict['preds'],
-        views=output_dict['views'],
-        min_conf_thr_percentile=85
-    )
+    if laf_k > 0:
+        # LAF mode: use pairwise chain alignment.
+        # Adjacent views share visual content → better registration than
+        # per-view independent alignment to potentially noisy pts3d_in_other_view.
+        lit_module.align_local_pairwise(
+            preds=output_dict['preds'],
+            views=output_dict['views'],
+            min_conf_thr_percentile=85,
+        )
+    else:
+        lit_module.align_local_pts3d_to_global(
+            preds=output_dict['preds'],
+            views=output_dict['views'],
+            min_conf_thr_percentile=85
+        )
     
     # Generate a unique message ID for this request
     message_id = f"msg_{int(time.time()*1000)}_{os.getpid()}_{id(state)}"
@@ -601,10 +558,12 @@ def process_images(uploaded_files, video_file, state,
     server_id = resp.get("server_id")
     state["urls"].append((share_url, server_id))
 
+    gpu_name = torch.cuda.get_device_name(0) if device.type == "cuda" else "N/A"
     final_status = (
-        f"{len(filelist)} images @ {image_size} resolution\n"
+        f"{len(filelist)} images @ {image_size} resolution, {laf_label}\n"
         f"Image loading and cropping time: {load_time:.2f} sec\n"
         f"Model inference time: {model_forward_time:.2f} sec\n"
+        f"Peak GPU memory: {peak_memory_mb:.0f} MiB  |  GPU: {gpu_name}\n"
         f"Visualization preparation time: {vis_prep_time:.2f} sec\n"
         f"👇 Scroll down to view the 3D reconstruction"
     )
@@ -1039,15 +998,22 @@ def create_demo(checkpoint_dir, examples_dir, output_dir, device: torch.device, 
         gr.HTML(header_html)
         with gr.Row():
             with gr.Column(scale=2):
-                gallery = gr.Gallery(label="Upload Images of a Scene", columns=6, height="150px", show_download_button=True)
+                gallery = gr.Gallery(label="Upload Images of a Scene", columns=6, height="150px", buttons=['download'])
                 video_input.render()
             with gr.Column(scale=1):
                 # Add resolution radio button
                 image_resolution = gr.Radio(
-                    ["512", "224"], 
-                    label="Image Resolution", 
-                    value="512", 
+                    ["512", "224"],
+                    label="Image Resolution",
+                    value="512",
                     info="Lower resolution (224) gives super fast speed with a small trade-off in quality"
+                )
+                # Add LAF mode radio button
+                laf_mode = gr.Radio(
+                    ["Dense (all-to-all)", "LAF k=1", "LAF k=2", "LAF k=5"],
+                    label="Cross-View Fusion Mode",
+                    value="LAF k=2",
+                    info="Dense: all views attend to each other. LAF k=N: each view attends to ±N neighbors + view 0 as global anchor. Larger k = better quality, more VRAM"
                 )
                 submit_button = gr.Button("Submit", variant="primary", size="lg")
                 status_box = gr.Textbox(label="Processing Speed", interactive=False, lines=5, visible=True)
@@ -1141,20 +1107,29 @@ def create_demo(checkpoint_dir, examples_dir, output_dir, device: torch.device, 
                     )
             raise gr.Error("Failed to handle feedback")
 
-        def process_images_wrapper(uploaded_files, video_file, state, image_resolution):
+        def process_images_wrapper(uploaded_files, video_file, state, image_resolution, laf_mode):
             # Reset is_example flag for direct uploads
             if not state.get("is_example", False):
                 state = state.copy()
                 state["is_example"] = False
-            
+
             # Convert image_resolution from string to integer
             image_size = int(image_resolution)
 
+            # Map laf_mode to k value
+            laf_map = {
+                "Dense (all-to-all)": 0,
+                "LAF k=1": 1,
+                "LAF k=2": 2,
+                "LAF k=5": 5,
+            }
+            laf_k = laf_map.get(laf_mode, 2)
+
             generator = process_images(uploaded_files, video_file, state,
                                      model, lit_module, device,
-                                     global_manager_req_queue, global_manager_resp_queue, 
+                                     global_manager_req_queue, global_manager_resp_queue,
                                      output_dir, examples_dir,
-                                     image_size=image_size)
+                                     image_size=image_size, laf_k=laf_k)
             
             for output in generator:
                 loading_message, vis_message, feedback_column, viser_iframe, status_box, state = output
@@ -1175,7 +1150,7 @@ def create_demo(checkpoint_dir, examples_dir, output_dir, device: torch.device, 
 
         submit_button.click(
             fn=process_images_wrapper,
-            inputs=[gallery, video_input, state, image_resolution],
+            inputs=[gallery, video_input, state, image_resolution, laf_mode],
             outputs=[loading_message, vis_message, feedback_column, viser_iframe, status_box, state, thumbs_up, thumbs_down, thank_you],
         )
 
@@ -1199,7 +1174,7 @@ def main():
     demo = create_demo(args.checkpoint_dir, args.examples_dir, args.output_dir, device=device, 
                        is_lightning_checkpoint=args.is_lightning_checkpoint)
     demo.queue(default_concurrency_limit=2)
-    demo.launch(share=True)
+    demo.launch(share=False)
 
 if __name__ == "__main__":
     main()
