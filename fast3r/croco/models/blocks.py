@@ -169,7 +169,7 @@ class Attention(nn.Module):
             x = self.proj(x)
             x = self.proj_drop(x)  
         elif self.attn_implementation == "flash_attention":
-            with torch.nn.attention.sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+            with torch.nn.attention.sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.MATH]):
                 dtype = k.dtype
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     x = scaled_dot_product_attention(q, k, v, attn_mask=self.attn_mask, dropout_p=self.dropout_p, is_causal=self.is_causal, scale=scale)
@@ -179,7 +179,7 @@ class Attention(nn.Module):
                 x = self.proj(x)
                 x = self.proj_drop(x)
         elif self.attn_implementation == "pytorch_auto":
-            with torch.nn.attention.sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION,]):
+            with torch.nn.attention.sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
                 dtype = k.dtype
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     x = scaled_dot_product_attention(q, k, v, attn_mask=self.attn_mask, dropout_p=self.dropout_p, is_causal=self.is_causal, scale=scale)
@@ -299,7 +299,7 @@ class CrossAttention(nn.Module):
             x = self.proj(x)
             x = self.proj_drop(x)
         elif self.attn_implementation == "flash_attention":
-            with torch.nn.attention.sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+            with torch.nn.attention.sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.MATH]):
                 # cast to BF16 to use flash_attention
                 q = q.to(torch.bfloat16)
                 k = k.to(torch.bfloat16)
